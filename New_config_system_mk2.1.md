@@ -83,7 +83,11 @@ FieldSpec {
 Validation is deterministic and path-oriented. Coercion/normalization behavior proven in code:
 
 - `boolean`: accepts `true|1|yes|y|on` and `false|0|no|n|off` (case-insensitive, trimmed)
-- `integer`, `float`, `duration`: parsed explicitly from string/numeric input
+- `integer`, `float`: parsed explicitly from string/numeric input
+- `duration`: accepts two forms:
+  - **Integer or float input**: treated as milliseconds (e.g. `5000` → 5 seconds).
+  - **String input**: one or more `{integer}{unit}` tokens, where unit ∈ `ms | s | m | h | d`, evaluated additively (e.g. `"1h30m"` = 5400 s, `"500ms"`, `"2h"`). Leading/trailing whitespace is trimmed; case-insensitive units.
+  - Coerced result: the language-native duration type where one exists (e.g. `time.Duration` in Go, `ActiveSupport::Duration` in Ruby); integer milliseconds otherwise.
 - `url`: requires `http://` or `https://`
 - env-key normalization: uppercase + non-alnum to `_`, dot/underscore mapping (Gleam)
 
@@ -112,7 +116,7 @@ This pattern is production-proven in TS (`ConnectorFactory`) and Ruby (`Connecto
 
 ## 4. Resolution Algorithm
 
-## 4.1 High-level algorithm
+### 4.1 High-level algorithm
 
 1. Build provider chain in explicit precedence order.
 2. For file-backed provider(s), pre-resolve `common + environment` map.
@@ -120,21 +124,31 @@ This pattern is production-proven in TS (`ConnectorFactory`) and Ruby (`Connecto
    - TS: ignore only `undefined`
    - Ruby: ignore only `nil`
    - Gleam: ignore only missing/`None`
-4. Apply lock semantics:
-   - TS: `lockAfter` sets a cutoff; later providers are ignored and surfaced as lock conflict diagnostics.
-   - Gleam: explicit `locked_keys[key] = layer`; only that layer may supply the value.
+4. Apply lock semantics. Two models exist; implementations choose one:
+   - **Cutoff model** (TS/Ruby): `lockAfter` names a layer; any provider at a higher precedence than that layer is ignored for the key, and the conflict is surfaced as a diagnostic.
+   - **Explicit lock model** (Gleam): `locked_keys[key] = layer` declares that only the named layer may supply the value; all other providers are ignored for the key.
+   Both models emit the same `LockConflict` diagnostic shape and are unified in the pseudocode via `lock_rule.blocks(provider_index, provider.layer)`.
 5. Apply schema default only when no value is present after lock/precedence.
 6. Coerce to target type and validate `required`, `enum`, `pattern`, constraints.
 7. Return immutable snapshot/result plus diagnostics/errors.
 
-## 4.2 Merge semantics
+### 4.2 Merge semantics
 
 - **Primary cross-provider merge mode:** key-wise winner selection (higher precedence layer wins).
 - **File layer pre-merge (TS/Ruby):** deep merge for map/hash values.
 - **Scalars and lists/arrays:** replaced by higher layer value.
 - **`chain_load_all` style map merges (Gleam):** right-hand provider wins on key collision.
 
-## 4.3 Pseudocode
+### 4.3 Provider `get` vs `load_all`
+
+The resolution pass uses two provider access modes:
+
+- **`get(key)`** — point lookup used in the per-key loop (§4.4). All providers must implement this.
+- **`load_all()`** — returns the provider's full key-value map. Used when bulk pre-fetching is more efficient (file providers, in-memory hash providers). Implementations may call `load_all` once per provider at the start of resolution and wrap the result as a `HashProvider`, replacing per-key `get` calls for that provider. Providers that cannot enumerate all keys (e.g., live DB or secrets adapters) may omit `load_all` and rely solely on `get`.
+
+The `chain_load_all` merge pattern (Gleam §4.2) calls `load_all` on each provider in order and merges the maps right-to-left, producing a single flat snapshot before the validation pass.
+
+### 4.4 Pseudocode
 
 ```text
 function resolve(plan, schema_registry, opts): ConfigResult
@@ -172,14 +186,26 @@ function resolve(plan, schema_registry, opts): ConfigResult
       errors.push(error_required(key))
       continue
 
-    if effective is not MISSING:
-      typed = coerce(effective, entry.type) or errors.push(error_type(key))
-      validate_enum_pattern_constraints(key, typed, entry, errors)
+    if effective is MISSING:
+      // Optional key with no value and no default — omit from output entirely.
+      if winner.locked_conflict:
+        diagnostics.push(lock_conflict_issue(key, entry.lock_rule))
+      continue
 
-    output[key] = effective
+    coerced = coerce(effective, entry.type)
+    if coerced is COERCE_ERROR:
+      errors.push(error_type(key))
+      continue   // do not store type-incorrect value in output
+
+    validate_enum_pattern_constraints(key, coerced, entry, errors)
+
+    output[key] = coerced   // store the coerced, normalized value
     if winner.locked_conflict:
       diagnostics.push(lock_conflict_issue(key, entry.lock_rule))
 
+  // On failure, `output` contains only keys that were successfully coerced.
+  // Callers may inspect it for partial diagnostics but must not treat it as
+  // a valid config snapshot.
   if errors.any():
     return failure(output, errors, diagnostics)
 
@@ -190,7 +216,7 @@ function resolve(plan, schema_registry, opts): ConfigResult
 
 ## 5. API Drafts
 
-## 5.1 Object-oriented API
+### 5.1 Object-oriented API
 
 ```text
 class ConfigLoader {
@@ -205,7 +231,7 @@ class ConfigLoader {
   reload(): this
   invalidate(key: string): void
   invalidateNamespace(prefix: string): void
-  setRuntime?(key: string, value: any): void
+  setRuntime(key: string, value: any): void   // optional — may be omitted in read-only implementations
 }
 
 class ConnectorFactory {
@@ -224,7 +250,7 @@ class Layer {
 }
 ```
 
-## 5.2 Non-OO / functional API
+### 5.2 Non-OO / functional API
 
 ```text
 resolve(plan, schemaRegistry, opts) -> Result<ConfigSnapshot, ConfigError[]>
@@ -259,7 +285,7 @@ resolve(plan, schema, cache) -> Result(ConfigSnapshot, List(ConfigError))
 
 ## 6. Algorithms and Data Structures
 
-## 6.1 Data structures
+### 6.1 Data structures
 
 - **ConfigMap**: `map<string, Value>`
 - **Provider**: `{name, get/load, load_all, optional set/reload}`
@@ -270,18 +296,18 @@ resolve(plan, schema, cache) -> Result(ConfigSnapshot, List(ConfigError))
 - **DiagnosticsReport**: validation/lock/source diagnostics
 - **ConnectorFactoryRegistry**: connector name -> builder fn
 
-## 6.2 Complexity targets
+### 6.2 Complexity targets
 
 Let:
 
 - `P` = number of providers
 - `K` = number of keys
-- `R` = validation rules
+- `R` = average number of validation rules per key (enum values, pattern check, min/max, length bounds)
 
 Target complexity:
 
-- Key resolution pass: $O(K * P)$
-- Validation: $O(R)$
+- Key resolution pass: $O(K \times P)$
+- Validation: $O(K \times R)$
 - File deep-merge per reload: $O(N)$ where `N` is merged node count
 - Cache lookup: $O(1)$ average
 
@@ -337,6 +363,8 @@ ConfigErrorEnvelope {
 ---
 
 ## 8. Language-Specific Notes
+
+Production reference implementations exist for **TypeScript**, **Ruby**, and **Gleam**. The notes for those languages reflect patterns proven in those implementations. All other languages (Python, JavaScript, Elixir, PHP, Rust, Go, C++) are **aspirational targets**: the observable semantics defined by this spec must be met, but idiomatic patterns for those ecosystems are left to the implementer.
 
 ### Ruby
 
